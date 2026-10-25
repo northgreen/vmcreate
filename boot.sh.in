@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Resolve resources against this script, independent of the caller directory.
+vm_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# Each launch owns its sockets; persistent disks and TPM state stay outside.
+# QEMU treats commas in a resolved directory as option separators, so stop early.
+for root_path in "$vm_dir" "${TMPDIR:-/tmp}"; do
+    if [[ "$root_path" == *,* ]]; then
+        printf 'vmcreate: script directory and TMPDIR must not contain commas\n' >&2
+        exit 1
+    fi
+done
+runtime_dir=$(mktemp -d "${TMPDIR:-/tmp}/vmcreate.XXXXXXXX")
+pids=()
+tpm_dir=
+share_dir=
+
+# Reap only children started by this launch, including on signals or errors.
+cleanup() {
+    local pid
+    for pid in "${pids[@]}"; do
+        kill "$pid" 2>/dev/null || :
+    done
+    for pid in "${pids[@]}"; do
+        wait "$pid" 2>/dev/null || :
+    done
+    rm -rf -- "$runtime_dir"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+vm_path() {
+    case "$1" in
+        /*) printf '%s\n' "$1" ;;
+        *) printf '%s/%s\n' "$vm_dir" "$1" ;;
+    esac
+}
+
+# Bound startup waiting and fail immediately if the service exits.
+wait_socket() {
+    local socket=$1 pid=$2 attempt
+    for ((attempt = 0; attempt < 100; attempt++)); do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            printf 'vmcreate: service exited before ready: %s\n' "$socket" >&2
+            return 1
+        fi
+        [[ ! -S "$socket" ]] || return 0
+        sleep 0.05
+    done
+    printf 'vmcreate: timed out waiting for socket: %s\n' "$socket" >&2
+    return 1
+}
+
+# Insert validated device settings before resolving final memory/CPU values.
+m4_undivert(1)
+# Finalize singleton settings once; declarations can appear in any order.
+args+=(-m "$memory_mib" -smp "$cpu_topology"
+       -accel "$accel" -cpu "${cpu_model}${cpu_flags:+,$cpu_flags}" -monitor "$monitor_mode")
+# Non-x86 architectures keep QEMU's built-in default machine.
+if [[ -n "$machine_spec" ]]; then
+    args+=(-machine "$machine_spec")
+fi
+for backend in "${net_backends[@]}"; do
+    args+=(-netdev "$backend")
+done
+if [[ "$serial_mode" == file ]]; then
+    args+=(-serial "file:$serial_path")
+else
+    args+=(-serial "$serial_mode")
+fi
+
+if [[ -n "$tpm_dir" ]]; then
+    mkdir -p -- "$tpm_dir"
+    swtpm socket --tpmstate "dir=$tpm_dir" \
+        --ctrl "type=unixio,path=$runtime_dir/tpm.sock" --tpm2 &
+    pids+=("$!")
+    wait_socket "$runtime_dir/tpm.sock" "${pids[-1]}"
+fi
+
+if [[ -n "$share_dir" ]]; then
+    args+=(-object "memory-backend-memfd,id=mem,size=${memory_mib}M,share=on" -numa node,memdev=mem)
+    "${VIRTIOFSD:-/usr/lib/virtiofsd}" --socket-path="$runtime_dir/virtiofs.sock" \
+        --shared-dir="$share_dir" "${virtiofs_args[@]}" &
+    pids+=("$!")
+    wait_socket "$runtime_dir/virtiofs.sock" "${pids[-1]}"
+fi
+
+# Preserve monitor stdin while retaining a PID for signal cleanup.
+# qemu_bin defaults to qemu-system-<arch>; VM_QEMU may point at another build.
+"$qemu_bin" "${args[@]}" <&0 &
+pids+=("$!")
+wait "${pids[-1]}"

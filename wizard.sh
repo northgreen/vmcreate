@@ -1,0 +1,390 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+if ! command -v gum >/dev/null; then
+    printf 'vmcreate: wizard needs gum (https://github.com/charmbracelet/gum)\n' >&2
+    exit 1
+fi
+if [[ ! -t 1 || ! -t 0 ]] && [[ "${WIZARD_ALLOW_NON_TTY:-}" != 1 ]]; then
+    printf 'vmcreate: run the wizard in an interactive terminal\n' >&2
+    exit 2
+fi
+
+# Prompt helpers print exactly the answer so callers can use command substitution.
+ask() {
+    local answer
+    answer=$(gum input --header "$1" --placeholder "$3") || {
+        printf '\nCancelled.\n' >&2
+        exit 130
+    }
+    answer=${answer:-$2}
+    printf '%s' "$answer"
+}
+
+# Cancel from a choose menu exits 130; an empty result falls back to the first item.
+choose() {
+    local answer status
+    answer=$(gum choose --header "$1" "${@:2}") && status=0 || status=$?
+    if [[ $status -ne 0 && $status -ne 1 ]]; then
+        printf '\nCancelled.\n' >&2
+        exit 130
+    fi
+    [[ -n "$answer" ]] || answer=$2
+    printf '%s' "$answer"
+}
+
+# Confirmations go through gum so the terminal owns input; the test substitute
+# answers from the same scripted stream as every other prompt.
+yes() {
+    gum confirm "$1"
+}
+
+positive() {
+    local value=${1#"${1%%[![:space:]]*}"}
+    [[ -n "$value" ]] || return 1
+    [[ "$value" =~ ^[1-9][0-9]*$ ]]
+}
+
+# Reject characters that would break the m4 argument or generated shell literal.
+macro_value() {
+    if [[ -n "$1" && "$1" != [[:space:]]* && "$1" != *"'"* && "$1" != *'['* && "$1" != *']'* && "$1" != *,* ]]; then
+        return 0
+    fi
+    printf 'Value cannot be empty, start with a space, or contain commas, single quotes, brackets.\n' >&2
+    return 1
+}
+
+ask_positive() {
+    local value
+    while :; do
+        value=$(ask "$1" "$2" "$3")
+        positive "$value" && {
+            printf '%s' "$value"
+            return
+        }
+        printf 'Enter a positive whole number.\n' >&2
+    done
+}
+
+ask_macro() {
+    local value
+    value=$(ask "$1" "$2" "$3")
+    macro_value "$value" || exit 1
+    printf '%s' "$value"
+}
+
+port() {
+    [[ "$1" =~ ^[1-9][0-9]*$ ]] && (( $1 <= 65535 ))
+}
+
+ask_port() {
+    local value
+    while :; do
+        value=$(ask_positive "$1" "$2" "$3")
+        port "$value" && {
+            printf '%s' "$value"
+            return
+        }
+        printf 'Ports must be between 1 and 65535.\n' >&2
+    done
+}
+
+# Inline submenus allow one device per session; the rest is a vm.m4 edit.
+# Returning (not exiting) keeps the wizard usable and never loses earlier answers.
+refuse_inline() {
+    printf 'Only one inline value per advanced item is accepted; add more in vm.m4.\n' >&2
+}
+
+# --- basic configuration -------------------------------------------------
+gum style --border rounded --padding '0 2' --bold 'vmcreate · new virtual machine' \
+    'Basic setup only; advanced devices are offered at the end.' \
+    'Nothing is created except the configuration and its startup script.'
+
+vm_name=
+while :; do
+    vm_name=$(ask 'VM name (letters, digits, dash, underscore)' 'my-vm' 'fedora-work')
+    if [[ "$vm_name" =~ ^[A-Za-z0-9_-]+$ ]]; then
+        break
+    fi
+    printf 'Use only letters, digits, "-" and "_".\n' >&2
+done
+
+memory=$(ask_positive 'Memory in MiB' '4096' '4096')
+sockets=$(ask_positive 'CPU sockets' '1' '1')
+cores=$(ask_positive 'Cores per socket' '4' '4')
+threads=$(ask_positive 'Threads per core' '1' '1')
+disk_file=$(ask_macro 'System disk file' 'hdd.img' 'hdd.img')
+disk_format=$(choose 'Disk format' 'qcow2' 'raw')
+disk_bus=$(choose 'Disk bus' 'virtio' 'ahci')
+
+# Step 6: UEFI firmware as one yes/no. CODE and VARS are auto-detected, so the
+# basic flow stays at ten prompts; override them in the advanced menu.
+uefi_code=
+uefi_vars=
+if yes 'Use UEFI firmware?'; then
+    for candidate in /usr/share/OVMF/x64/OVMF_CODE.secboot.4m.fd /usr/share/OVMF/OVMF_CODE.secboot.4m.fd \
+        /usr/share/OVMF/x64/OVMF_CODE.4m.fd /usr/share/OVMF/OVMF_CODE.4m.fd; do
+        [[ -f "$candidate" ]] && { uefi_code=$candidate; break; }
+    done
+    [[ -n "$uefi_code" ]] || { printf 'No UEFI CODE found in the usual OVMF paths.\n' >&2; exit 1; }
+    uefi_vars=my_vars.fd
+fi
+
+# Each advanced answer emits at most one macro; repetition stays a vm.m4 edit.
+advanced_lines=()
+advanced_network=
+
+advanced_menu() {
+    while :; do
+        local item
+        item=$(choose 'Advanced configuration (Done finishes)' \
+            'Done' \
+            'Skip' \
+            'Firmware, machine, CPU and boot' \
+            'Storage: extra disk, floppy, ISO, snapshot, read-only' \
+            'Network: user NIC, forwards, TAP, bridge' \
+            'Display: local, audio, VNC, SPICE, headless' \
+            'Console: serial, QEMU log, QMP' \
+            'Devices: TPM, share, Guest Agent, USB, VFIO' \
+            'Direct kernel boot')
+        case "$item" in
+        Done) return ;;
+        Skip) return ;;
+        'Firmware, machine, CPU and boot') firmware_menu ;;
+        'Storage: extra disk, floppy, ISO, snapshot, read-only') storage_menu ;;
+        'Network: user NIC, forwards, TAP, bridge') network_menu ;;
+        'Display: local, audio, VNC, SPICE, headless') display_menu ;;
+        'Console: serial, QEMU log, QMP') console_menu ;;
+        'Devices: TPM, share, Guest Agent, USB, VFIO') devices_menu ;;
+        'Direct kernel boot') kernel_menu ;;
+        esac
+    done
+}
+
+firmware_menu() {
+    local machine accel model flags order once boot_menu
+    if [[ $(gum choose --header 'Advanced configuration (Firmware/T boot): skip to return' 'Skip' 'Continue') == Skip ]]; then
+        return
+    fi
+    machine=$(choose 'Machine model' 'default' 'pc' 'q35')
+    accel=$(choose 'Accelerator' 'default' 'kvm' 'tcg')
+    model=$(ask_macro 'CPU model (empty for default)' '' 'qemu32')
+    flags=$(ask 'CPU features (empty for none)' '' '+aes,hv_relaxed=on')
+    order=$(ask 'Boot order (a, c, d, n; empty keeps default)' '' 'e.g. cad')
+    once=$(ask 'One-time boot order (empty for none)' '' 'e.g. d')
+    boot_menu=$(choose 'Boot menu' 'off' 'on')
+    local -a firmware_lines=()
+    [[ "$machine" == default ]] || firmware_lines+=("VM_MACHINE([$machine])")
+    [[ "$accel" == default ]] || firmware_lines+=("VM_ACCEL([$accel])")
+    [[ -z "$model" ]] || firmware_lines+=("VM_CPU_MODEL([$model])")
+    [[ -z "$flags" ]] || firmware_lines+=("VM_CPU_FLAGS([$flags])")
+    [[ -z "$order" ]] || firmware_lines+=("VM_BOOT([$order], [$once], [$boot_menu])")
+    advanced_lines+=("${firmware_lines[@]}")
+}
+
+storage_menu() {
+    local file format bus mode floppy unit cdrom
+    if [[ $(gum choose --header 'Advanced configuration (Storage): skip to return' 'Skip' 'Continue') == Skip ]]; then
+        return
+    fi
+    if yes 'Add another disk?'; then
+        refuse_inline || continue
+        file=$(ask_macro 'Extra disk file' 'data.img' 'data.img')
+        format=$(choose 'Extra disk format' 'qcow2' 'raw')
+        bus=$(choose 'Extra disk bus' 'virtio' 'ahci' 'ide')
+        mode=$(choose 'Disk access mode' 'rw' 'ro' 'snapshot')
+        advanced_lines+=("VM_DISK([$file], [$format], [$bus], [$mode])")
+    fi
+    if yes 'Attach a floppy image?'; then
+        refuse_inline || continue
+        file=$(ask_macro 'Floppy image' 'floppy.img' 'floppy.img')
+        unit=$(choose 'Floppy unit' '0' '1')
+        mode=$(choose 'Floppy access mode' 'rw' 'ro' 'snapshot')
+        advanced_lines+=("VM_FLOPPY([$file], [$unit], [$mode])")
+    fi
+    if yes 'Attach an installation ISO?'; then
+        refuse_inline || continue
+        cdrom=$(ask_macro 'ISO path' '/home/user/Downloads/install.iso' '/home/user/Downloads/install.iso')
+        advanced_lines+=("VM_CDROM([$cdrom])")
+    fi
+    if yes 'Discard all disk writes on exit (VM_SNAPSHOT)?'; then
+        advanced_lines+=("VM_SNAPSHOT")
+    fi
+}
+
+network_menu() {
+    if [[ $(gum choose --header 'Advanced configuration (Network): skip to return' 'Skip' 'Continue') == Skip ]]; then
+        return
+    fi
+    local model mac protocol host_port guest_port address nic bridge ifname
+    if [[ -z "$advanced_network" ]] && yes 'Attach a user-mode NIC?'; then
+        advanced_network=$(ask 'NIC identifier' 'mgmt' 'mgmt')
+        model=$(choose 'NIC model' 'virtio-net-pci' 'e1000' 'rtl8139')
+        mac=$(ask 'MAC address (empty for QEMU default)' '' '52:54:00:12:34:56')
+        if [[ -n "$mac" ]]; then
+            advanced_lines+=("VM_NET_USER([$advanced_network], [$model], [$mac])")
+        else
+            advanced_lines+=("VM_NET_USER([$advanced_network], [$model])")
+        fi
+    fi
+    if [[ -n "$advanced_network" ]] && yes 'Forward a host port on the user NIC?'; then
+        refuse_inline || continue
+        protocol=$(choose 'Forward protocol' 'tcp' 'udp')
+        host_port=$(ask_port 'Host port' '2225' '2225')
+        guest_port=$(ask_port 'Guest port' '22' '22')
+        address=$(ask 'Host bind address' '127.0.0.1' '127.0.0.1')
+        advanced_lines+=("VM_NET_FORWARD([$advanced_network], [$protocol], [$host_port], [$guest_port], [$address])")
+    fi
+    if yes 'Attach a TAP interface?'; then
+        refuse_inline || continue
+        nic=$(ask 'NIC identifier' 'lan' 'lan')
+        ifname=$(ask 'TAP interface' 'tap0' 'tap0')
+        model=$(choose 'NIC model' 'virtio-net-pci' 'e1000' 'rtl8139')
+        advanced_lines+=("VM_NET_TAP([$nic], [$ifname], [$model])")
+    fi
+    if yes 'Attach a bridge?'; then
+        refuse_inline || continue
+        nic=$(ask 'NIC identifier' 'bridge' 'bridge')
+        bridge=$(ask 'Bridge name' 'br0' 'br0')
+        model=$(choose 'NIC model' 'virtio-net-pci' 'e1000' 'rtl8139')
+        advanced_lines+=("VM_NET_BRIDGE([$nic], [$bridge], [$model])")
+    fi
+}
+
+display_menu() {
+    if [[ $(gum choose --header 'Advanced configuration (Display): skip to return' 'Skip' 'Continue') == Skip ]]; then
+        return
+    fi
+    local backend graphics audio port_number serial file
+    if yes 'Configure a local graphical display?'; then
+        backend=$(choose 'Display backend' 'gtk' 'none')
+        graphics=$(choose 'Graphics device' 'virtio-gpu-pci' 'VGA')
+        advanced_lines+=("VM_DISPLAY([$backend], [$graphics])")
+    fi
+    if yes 'Enable audio?'; then
+        audio=$(choose 'Audio backend' 'pa' 'pipewire')
+        advanced_lines+=("VM_AUDIO([$audio])")
+    fi
+    if yes 'Use VNC on loopback?'; then
+        port_number=$(ask 'VNC display number' '1' '1')
+        advanced_lines+=("VM_VNC([$port_number])")
+    fi
+    if yes 'Use SPICE on loopback?'; then
+        advanced_lines+=("VM_SPICE([$(ask_port 'SPICE port' '5930' '5930')])")
+    fi
+    if yes 'Run headless with serial console on stdio?'; then
+        advanced_lines+=("VM_HEADLESS")
+    fi
+}
+
+console_menu() {
+    if [[ $(gum choose --header 'Advanced configuration (Console): skip to return' 'Skip' 'Continue') == Skip ]]; then
+        return
+    fi
+    local mode file items
+    if yes 'Configure the QEMU monitor?'; then
+        advanced_lines+=("VM_MONITOR([$(choose 'Monitor' 'stdio' 'none')])")
+    fi
+    if yes 'Configure a single serial port?'; then
+        mode=$(choose 'Serial mode' 'none' 'stdio' 'file')
+        if [[ "$mode" == file ]]; then
+            file=$(ask_macro 'Serial output file' 'serial.log' 'serial.log')
+            advanced_lines+=("VM_SERIAL([file], [$file])")
+        else
+            advanced_lines+=("VM_SERIAL([$mode])")
+        fi
+    fi
+    if yes 'Write QEMU debug log?'; then
+        file=$(ask_macro 'QEMU log file' 'qemu.log' 'qemu.log')
+        items=$(ask 'Debug categories' 'guest_errors,unimp' 'guest_errors,unimp')
+        advanced_lines+=("VM_LOG([$file], [$items])")
+    fi
+    if yes 'Expose a QMP control socket?'; then
+        advanced_lines+=("VM_QMP([$(ask_macro 'QMP socket path' 'qmp.sock' 'qmp.sock')])")
+    fi
+}
+
+devices_menu() {
+    if [[ $(gum choose --header 'Advanced configuration (Devices): skip to return' 'Skip' 'Continue') == Skip ]]; then
+        return
+    fi
+    local tpm share_tag share_mode bus address bdf
+    if yes 'Add a TPM 2.0 device?'; then
+        tpm=$(ask_macro 'TPM state directory' 'tpm' 'tpm')
+        advanced_lines+=("VM_TPM([$tpm])")
+    fi
+    if yes 'Share a host directory with the guest?'; then
+        refuse_inline || continue
+        address=$(ask 'Host directory' '/home/user/Public' '/home/user/Public')
+        share_tag=$(ask 'Guest mount tag' 'virtiofs' 'virtiofs')
+        share_mode=$(choose 'Share mode' 'rw' 'ro')
+        advanced_lines+=("VM_SHARE([$address], [$share_tag], [$share_mode])")
+    fi
+    if yes 'Expose QEMU Guest Agent socket?'; then
+        advanced_lines+=("VM_GUEST_AGENT")
+    fi
+    if yes 'Pass through a host USB device?'; then
+        refuse_inline || continue
+        bus=$(ask_positive 'Host USB bus' '1' '1')
+        address=$(ask_positive 'Host USB address' '2' '2')
+        advanced_lines+=("VM_USB_HOST([$bus], [$address])")
+    fi
+    if yes 'Pass through a VFIO PCI device?'; then
+        refuse_inline || continue
+        bdf=$(ask 'Host PCI address (dddd:bb:ss.f)' '0000:01:00.0' '0000:01:00.0')
+        advanced_lines+=("VM_VFIO([$bdf])")
+    fi
+}
+
+kernel_menu() {
+    local kernel initrd cmdline
+    refuse_inline || return
+    kernel=$(ask_macro 'Kernel image' 'vmlinuz' 'vmlinuz')
+    initrd=$(ask 'Initrd image (empty for none)' '' 'initrd.img')
+    cmdline=$(ask 'Kernel command line' 'console=ttyS0' 'root=/dev/vda console=ttyS0')
+    advanced_lines+=("VM_KERNEL([$kernel]${initrd:+[, ]}$initrd${cmdline:+[, ]}$cmdline)")
+}
+
+if [[ $(gum choose --header 'Advanced configuration?' 'Skip' 'Configure') == Configure ]]; then
+    advanced_menu
+fi
+
+# Build the declaration in memory; the generator performs final macro validation.
+config=$(
+    printf 'VM_INIT([%s])\n' "$vm_name"
+    printf 'VM_MEMORY([%s])\n' "$memory"
+    printf 'VM_CPU([%s], [%s], [%s])\n' "$sockets" "$cores" "$threads"
+    [[ -z "$uefi_code" ]] || printf 'VM_UEFI([%s], [%s])\n' "$uefi_code" "$uefi_vars"
+    printf 'VM_DISK([%s], [%s], [%s])\n' "$disk_file" "$disk_format" "$disk_bus"
+    printf '%s\n' "${advanced_lines[@]}"
+    printf 'VM_OUTPUT\n'
+)
+
+gum style --border normal --padding '0 2' --bold 'Configuration preview'
+printf '%s\n' "$config"
+
+default_dir="${VM_DIR:-$HOME/vm}/$vm_name"
+directory=$(ask 'Output directory' "$default_dir" 'directory for vm.m4 and boot.sh')
+directory=${directory/#\~/$HOME}
+config_path=$directory/vm.m4
+boot_path=$directory/boot.sh
+
+if [[ -e "$config_path" || -e "$boot_path" ]]; then
+    printf 'Refusing to overwrite existing %s or %s.\n' "$config_path" "$boot_path" >&2
+    exit 1
+fi
+
+mkdir -p -- "$directory"
+printf '%s\n' "$config" > "$config_path"
+if ! bash "$root/generate-boot.sh" "$config_path" "$boot_path"; then
+    rm -f -- "$config_path"
+    printf 'Generation failed; configuration removed again.\n' >&2
+    exit 1
+fi
+
+gum style --border rounded --padding '0 2' --bold 'Ready' \
+    "Configuration: $config_path" \
+    "Startup script: $boot_path" \
+    'Put the disk and other files next to boot.sh, then run:' \
+    "  bash $boot_path"

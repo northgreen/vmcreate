@@ -1,0 +1,213 @@
+# Extension contracts: execute generated scripts only with QEMU argument recorder.
+set root [file normalize $srcdir]
+set work [file normalize [file join [pwd] "extensions [pid]"]]
+file mkdir $work
+set config [file join $work vm.m4]
+set output [file join $work boot.sh]
+proc ext_write {path text} {
+    set f [open $path w]; puts -nonewline $f $text; close $f
+}
+proc ext_read {path} { set f [open $path r]; set s [read $f]; close $f; return $s }
+proc ext_generate {body} {
+    global root config output
+    ext_write $config "VM_INIT(\[test\])\n$body\nVM_OUTPUT\n"
+    exec bash [file join $root generate-boot.sh] $config $output 2>@1
+}
+file mkdir [file join $work bin]
+ext_write [file join $work bin qemu-system-x86_64] {#!/usr/bin/env bash
+printf '%s\n' "$@" > "$CAPTURE"
+}
+file attributes [file join $work bin qemu-system-x86_64] -permissions 0755
+set saved_path $env(PATH)
+set env(PATH) "[file join $work bin]:$saved_path"
+set env(CAPTURE) [file join $work argv]
+proc ext_case {name body expected} {
+    global output env work
+    if {[catch {ext_generate $body; exec bash $output 2>@1} msg]} {
+        fail $name; verbose $msg 1; return
+    }
+    set args [split [string trimright [ext_read $env(CAPTURE)] "\n"] "\n"]
+    foreach value $expected {
+        set value [string map [list @DIR@ $work] $value]
+        if {[lsearch -exact $args $value] >= 0} { pass "$name: $value" } else {
+            fail "$name: $value"; verbose "argv=$args" 1
+        }
+    }
+}
+ext_case hardware {VM_MACHINE([pc])
+VM_ACCEL([tcg])
+VM_CPU_MODEL([qemu32])
+VM_CPU_FLAGS([+aes,hv_relaxed=on])
+VM_BOOT([cad], [a], [on])
+VM_FLOPPY([boot.img], [0], [ro])
+VM_FLOPPY([data.img], [1], [snapshot])
+VM_DISK([system.img], [raw], [ide])
+VM_CDROM([install.iso])
+VM_DISK([data.qcow2], [qcow2], [virtio], [ro])
+VM_SNAPSHOT} {pc tcg qemu32,+aes,hv_relaxed=on order=cad,once=a,menu=on
+{file=@DIR@/boot.img,format=raw,if=floppy,index=0,readonly=on}
+{file=@DIR@/data.img,format=raw,if=floppy,index=1,snapshot=on}
+{id=vmcreate_disk0,if=ide,file=@DIR@/system.img,format=raw,index=0}
+{file=@DIR@/install.iso,format=raw,media=cdrom,readonly=on,if=ide,index=1}
+{id=vmcreate_disk1,if=virtio,file=@DIR@/data.qcow2,format=qcow2,readonly=on} -snapshot}
+ext_case network {VM_NET_USER([mgmt], [e1000], [52:54:00:11:22:33])
+VM_NET_FORWARD([mgmt], [tcp], [2225], [22])
+VM_NET_FORWARD([mgmt], [udp], [5353], [53])
+VM_NET_TAP([lan], [tap0], [rtl8139])
+VM_NET_BRIDGE([bridge0], [br0], [virtio-net-pci])} {
+{user,id=mgmt,hostfwd=tcp:127.0.0.1:2225-:22,hostfwd=udp:127.0.0.1:5353-:53}
+{e1000,netdev=mgmt,mac=52:54:00:11:22:33}
+{tap,id=lan,ifname=tap0,script=no,downscript=no}
+{bridge,id=bridge0,br=br0}}
+ext_case control {VM_HEADLESS
+VM_QMP([control.sock])
+VM_LOG([debug.log], [guest_errors,unimp])
+VM_KERNEL([vmlinuz], [initrd.img], [root=/dev/vda console=ttyS0 $(literal)])
+VM_USB_HOST([1], [2])
+VM_VFIO([0000:01:00.0])} {
+none stdio {unix:@DIR@/control.sock,server=on,wait=off}
+@DIR@/debug.log guest_errors,unimp @DIR@/vmlinuz @DIR@/initrd.img
+{root=/dev/vda console=ttyS0 $(literal)}
+{usb-host,bus=usb.0,hostbus=1,hostaddr=2} {vfio-pci,host=0000:01:00.0}}
+ext_case vnc {VM_DISPLAY([none], [VGA])
+VM_VNC([1])
+VM_MONITOR([none])
+VM_SERIAL([file], [serial.log])} {{127.0.0.1:1} file:@DIR@/serial.log}
+ext_case spice {VM_SPICE([5930])} {{addr=127.0.0.1,port=5930,disable-ticketing=on}}
+# Optional arities and declaration order are part of the public interface.
+ext_case kernel_min {VM_KERNEL([vmlinuz])} {@DIR@/vmlinuz}
+ext_case serial {VM_MONITOR([none])
+VM_SERIAL([stdio])} {none stdio}
+ext_case tap_mac {VM_NET_TAP([x], [tap0], [e1000], [52:54:00:12:34:56])
+VM_NET_BRIDGE([b], [br0], [rtl8139], [52:54:00:12:34:57])} {
+{e1000,netdev=x,mac=52:54:00:12:34:56} {rtl8139,netdev=b,mac=52:54:00:12:34:57}}
+# VNC arrives before the display device that declares the shared USB controller.
+foreach body {{VM_VNC([1])
+VM_DISPLAY([none], [VGA])
+VM_USB_HOST([2], [3])} {VM_DISPLAY([none], [VGA])
+VM_VNC([1])}} {
+    if {[catch {ext_generate $body} msg]} { fail "VNC declaration-order generation"; verbose $msg 1 } else {
+        set text [ext_read $output]
+        if {[regexp -all {127.0.0.1:1} $text] == 1 && [regexp -all {usb-ehci,id=usb} $text] == 1} {
+            pass "VNC declaration-order output"
+        } else { fail "VNC declaration-order output" }
+    }
+}
+set disks {}
+for {set n 0} {$n < 7} {incr n} { append disks "VM_DISK(\[disk$n.img\], \[raw\], \[ahci\])\n" }
+ext_case ahci $disks {{ahci,id=vmcreate_ahci0} {ahci,id=vmcreate_ahci1} {ide-hd,drive=vmcreate_disk6,bus=vmcreate_ahci1.0}}
+
+foreach {name body error} {
+    machine {VM_MACHINE([arm])} {invalid value}
+    accel {VM_ACCEL([invalid])} {expected kvm or tcg}
+    flags {VM_CPU_FLAGS([bad flags])} {invalid value}
+    menu {VM_BOOT([c], [], [yes])} {menu must}
+    disk_mode {VM_DISK([a], [raw], [virtio], [invalid])} {storage mode}
+    reserved {VM_NET_USER([vmcreate_x], [e1000])} {reserved}
+    mac {VM_NET_USER([x], [e1000], [bad])} {invalid network MAC}
+    protocol {VM_NET_USER([x], [e1000])
+VM_NET_FORWARD([x], [sctp], [22], [22])} {protocol}
+    backend {VM_NET_TAP([x], [tap0], [e1000])
+VM_NET_FORWARD([x], [tcp], [22], [22])} {requires a user backend}
+    serial_file {VM_SERIAL([file])} {expected 2 arguments}
+    serial_extra {VM_SERIAL([stdio], [a])} {expected 1 arguments}
+    qmp {VM_QMP([a])
+VM_QMP([b])} {duplicate}
+    remote {VM_VNC([0])
+VM_SPICE([5930])} {only one remote}
+    reverse_display {VM_DISPLAY([gtk], [VGA])
+VM_VNC([0])} {conflicts}
+    headless_serial {VM_HEADLESS
+VM_SERIAL([stdio])} {conflicts}
+    usb_range {VM_USB_HOST([1], [128])} {out of range}
+    vfio_duplicate {VM_VFIO([0000:01:00.0])
+VM_VFIO([0000:01:00.0])} {duplicate}
+    tcg {VM_ACCEL([tcg])} {host requires kvm}
+    boot {VM_BOOT([aac])} {duplicate boot letter}
+    floppy {VM_FLOPPY([a])
+VM_FLOPPY([b])} {duplicate}
+    forward {VM_NET_FORWARD([missing], [tcp], [22], [22])} {previously declared}
+    netid {VM_NET_USER([x], [e1000])
+VM_NET_TAP([x], [tap0], [e1000])} {duplicate network}
+    bind {VM_NET_USER([x], [e1000])
+VM_NET_FORWARD([x], [tcp], [22], [22])
+VM_NET_FORWARD([x], [tcp], [22], [80])} {duplicate network forward}
+    wildcard {VM_NET_USER([x], [e1000])
+VM_NET_FORWARD([x], [udp], [22], [22], [0.0.0.0])
+VM_NET_FORWARD([x], [udp], [22], [80])} {wildcard}
+    stdio {VM_SERIAL([stdio])} {both use stdio}
+    display {VM_VNC([0])
+VM_DISPLAY([gtk], [VGA])} {conflicts}
+    headless {VM_DISPLAY([none], [VGA])
+VM_HEADLESS} {conflicts}
+    usb {VM_USB_HOST([1], [2])
+VM_USB_HOST([1], [2])} {duplicate USB}
+    vfio {VM_VFIO([0000:01:00.8])} {invalid canonical}
+    share {VM_SHARE([shared], [host], [invalid])} {share mode}
+    port {VM_SPICE([999999999999999999])} {invalid port}
+    ipv4 {VM_NET_USER([x], [e1000])
+VM_NET_FORWARD([x], [tcp], [22], [22], [256.0.0.1])} {255}
+} {
+    ext_write $output "preserve\n"
+    if {[catch {ext_generate $body} msg] && [string first $error $msg] >= 0} {
+        pass "reject extension $name"
+    } else { fail "reject extension $name"; verbose $msg 1 }
+    if {[ext_read $output] eq "preserve\n"} { pass "atomic extension $name" } else { fail "atomic extension $name" }
+}
+# A real Unix socket substitute verifies service argv, readiness and EXIT cleanup.
+set daemon [file join $work bin virtiofsd]
+ext_write $daemon {#!/usr/bin/env python3
+import os, signal, socket, sys
+with open(os.environ["SERVICE_CAPTURE"], "w") as f:
+    f.write("\n".join(sys.argv[1:]))
+path = next(a.split("=", 1)[1] for a in sys.argv if a.startswith("--socket-path="))
+sock = socket.socket(socket.AF_UNIX)
+sock.bind(path)
+def stop(*_):
+    with open(os.environ["SERVICE_STOP"], "w") as f:
+        f.write("stopped")
+    sys.exit(0)
+signal.signal(signal.SIGTERM, stop)
+while True:
+    signal.pause()
+}
+file attributes $daemon -permissions 0755
+set env(VIRTIOFSD) $daemon
+set env(SERVICE_CAPTURE) [file join $work service.args]
+set env(SERVICE_STOP) [file join $work service.stop]
+foreach mode {ro rw} {
+    file delete -force $env(SERVICE_STOP)
+    if {[catch {ext_generate "VM_SHARE(\[shared\], \[host\], \[$mode\])"; exec bash $output 2>@1} msg]} {
+        fail "share $mode daemon execution"; verbose $msg 1
+    } else {
+        set text [ext_read $env(SERVICE_CAPTURE)]
+        if {[expr {[string first --readonly $text] >= 0}] == [expr {$mode eq "ro"}]} {
+            pass "share $mode actual daemon permissions"
+        } else { fail "share $mode actual daemon permissions" }
+        if {[file exists $env(SERVICE_STOP)]} { pass "share $mode child reaped" } else { fail "share $mode child reaped" }
+        set socketarg [lindex [split $text "\n"] 0]
+        set socketpath [string range $socketarg [string length --socket-path=] end]
+        if {![file exists [file dirname $socketpath]]} { pass "share $mode runtime removed" } else { fail "share $mode runtime removed" }
+    }
+}
+# A colon in the script path would make QEMU misread file= as a protocol.
+set colon [file join $work "bad,dir"]
+file mkdir $colon
+set saved_output $output
+set output [file join $colon boot.sh]
+if {[catch {ext_generate "VM_DISK(\[a.img\], \[raw\], \[virtio\])"; exec bash $output 2>@1} msg] && [string first commas $msg] >= 0} {
+    pass "comma-unsafe absolute path rejected before launch"
+} else { fail "comma-unsafe absolute path rejected before launch"; verbose $msg 1 }
+set output $saved_output
+unset env(VIRTIOFSD) env(SERVICE_CAPTURE) env(SERVICE_STOP)
+# Device order cannot introduce duplicate controllers.
+foreach body {{VM_USB_HOST([1], [2])
+VM_DISPLAY([none], [VGA])} {VM_DISPLAY([none], [VGA])
+VM_USB_HOST([1], [2])}} {
+    if {[catch {ext_generate $body} msg]} { fail "shared USB controller generation" } else {
+        if {[regexp -all {usb-ehci,id=usb} [ext_read $output]] == 1} { pass "single shared USB controller" } else { fail "single shared USB controller" }
+    }
+}
+set env(PATH) $saved_path
+unset env(CAPTURE)
+file delete -force $work

@@ -1,0 +1,136 @@
+# Drive the gum TUI through a scripted substitute; never launch a VM.
+# One shell runs the wizard so the substitute consumes answers in order from a
+# single file, one line per prompt. An empty line accepts the default.
+set root [file normalize $srcdir]
+set work [file join /tmp "wizard-[pid]"]
+file delete -force $work
+file mkdir [file join $work bin]
+set fake [file join $work bin gum]
+set payload [file join $work answers.txt]
+
+set channel [open $fake w]
+puts -nonewline $channel {#!/usr/bin/env bash
+case $1 in
+style|pager) exit 0 ;;
+confirm)
+    IFS= read -r answer || answer=
+    case $answer in y*) exit 0 ;; *) exit 1 ;; esac
+    ;;
+choose)
+    IFS= read -r answer || answer=
+    for item in "$@"; do
+        [[ "$answer" == "$item" ]] && { printf '%s' "$answer"; exit 0; }
+    done
+    exit 0
+    ;;
+esac
+IFS= read -r answer || answer=
+printf '%s' "$answer"
+}
+close $channel
+file attributes $fake -permissions 0755
+
+set old_path $env(PATH)
+set old_home $env(HOME)
+set env(PATH) "[file join $work bin]:$old_path"
+set env(HOME) [file join $work home]
+set env(WIZARD_ALLOW_NON_TTY) 1
+file mkdir $env(HOME)
+
+proc write_answers {path lines} {
+    set channel [open $path w]
+    foreach line $lines {
+        puts $channel $line
+    }
+    close $channel
+}
+proc get_file {path} {
+    set channel [open $path r]
+    set text [read $channel]
+    close $channel
+    return $text
+}
+proc check_contains {text expected label} {
+    if {[string first $expected $text] >= 0} { pass $label } else { fail $label }
+}
+proc check_omits {text expected label} {
+    if {[string first $expected $text] < 0} { pass $label } else { fail $label }
+}
+
+# Answers shared by every case: name, memory, sockets, cores, threads, disk
+# file, disk format, disk bus, UEFI prompt. Empty answers accept defaults.
+set basic_prefix {my-vm 4096 1 4 1 hdd.img qcow2 virtio n}
+
+# Run the wizard with ANSWERS plus DIR as the final output directory.
+proc run_case {answers directory} {
+    global root payload work
+    file mkdir $directory
+    write_answers $payload [concat $answers [list $directory]]
+    set ::last_message {}
+    return [catch {exec bash [file join $root wizard.sh] < $payload 2>@1} ::last_message]
+}
+
+# Basic flow keeps steps 1-10, then the output directory; advanced is skipped.
+set basic_dir [file join $work basic]
+set status [run_case [concat $basic_prefix {Skip}] $basic_dir]
+if {$status} { fail "basic flow completes"; verbose $::last_message 1 } else { pass "basic flow completes" }
+set basic_config [file join $basic_dir vm.m4]
+set basic_boot [file join $basic_dir boot.sh]
+if {[file readable $basic_config]} { pass "basic writes vm.m4" } else { fail "basic writes vm.m4" }
+if {[file executable $basic_boot]} { pass "basic writes boot.sh" } else { fail "basic writes boot.sh" }
+if {[file readable $basic_config]} {
+    set text [get_file $basic_config]
+    foreach line {
+        {VM_INIT([my-vm])}
+        {VM_MEMORY([4096])}
+        {VM_CPU([1], [4], [1])}
+        {VM_DISK([hdd.img], [qcow2], [virtio])}
+        {VM_OUTPUT}
+    } { check_contains $text $line "basic contains $line" }
+    foreach skipped {VM_DISPLAY VM_CDROM VM_UEFI VM_AUDIO VM_TPM VM_SHARE VM_GUEST_AGENT VM_MACHINE} {
+        check_omits $text $skipped "basic omits $skipped"
+    }
+}
+
+# Firmware submenu: gate, machine, accelerator, CPU model, features, boot order,
+# one-time order, boot menu, then main menu Done. UEFI is a basic step now.
+set firmware_dir [file join $work firmware]
+set status [run_case [concat $basic_prefix {Configure
+    {Firmware, machine, CPU and boot} Continue q35 tcg qemu32 {} {} {} off Done}] $firmware_dir]
+if {$status} { fail "firmware submenu completes"; verbose $::last_message 1 } else { pass "firmware submenu completes" }
+if {[file readable [file join $firmware_dir vm.m4]]} {
+    set text [get_file [file join $firmware_dir vm.m4]]
+    foreach line {{VM_MACHINE([q35])} {VM_ACCEL([tcg])} {VM_CPU_MODEL([qemu32])}} {
+        check_contains $text $line "firmware writes $line"
+    }
+}
+
+# Storage submenu: one extra disk, then floppy, ISO and snapshot declined.
+set storage_dir [file join $work storage]
+set status [run_case [concat $basic_prefix {Configure
+    {Storage: extra disk, floppy, ISO, snapshot, read-only} Continue
+    y data.img raw virtio snapshot n n n Done}] $storage_dir]
+if {$status} { fail "storage submenu completes"; verbose $::last_message 1 } else { pass "storage submenu completes" }
+if {[file readable [file join $storage_dir vm.m4]]} {
+    check_contains [get_file [file join $storage_dir vm.m4]] {VM_DISK([data.img], [raw], [virtio], [snapshot])} "storage writes extra disk"
+}
+
+# Invalid VM names are re-asked before the rest of the flow continues.
+set invalid_dir [file join $work invalid]
+set status [run_case [concat {bad name! name-vm} [lrange $basic_prefix 1 end] {Skip}] $invalid_dir]
+if {$status} { fail "invalid name is re-asked" } else { pass "invalid name is re-asked" }
+if {[file readable [file join $invalid_dir vm.m4]]} { pass "retry writes vm.m4" } else { fail "retry writes vm.m4" }
+
+# Existing output is never replaced.
+if {[file readable $basic_config]} {
+    set before [get_file $basic_config]
+    set status [run_case [concat $basic_prefix {Skip}] $basic_dir]
+    if {[string first {Refusing to overwrite} $::last_message] >= 0 && [get_file $basic_config] eq $before} {
+        pass "existing output is not replaced"
+    } else { fail "existing output is not replaced" }
+}
+
+set env(PATH) $old_path
+set env(HOME) $old_home
+unset -nocomplain env(WIZARD_ALLOW_NON_TTY)
+file delete -force $work

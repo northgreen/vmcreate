@@ -1,0 +1,279 @@
+# Real m4 expansion and argument capture only: never boot a guest.
+set root [file normalize $srcdir]
+set work [file normalize [file join [pwd] "scratch [pid]"]]
+file mkdir $work
+set config [file join $work machine.m4]
+set output [file join $work guest boot.sh]
+
+proc put_file {path text} {
+    set channel [open $path w]
+    puts -nonewline $channel $text
+    close $channel
+}
+proc get_file {path} {
+    set channel [open $path r]
+    set text [read $channel]
+    close $channel
+    return $text
+}
+proc generate {source} {
+    global config output root
+    put_file $config $source
+    return [exec bash [file join $root generate-boot.sh] $config $output 2>@1]
+}
+proc check_contains {text expected name} {
+    if {[string first $expected $text] >= 0} { pass $name } else {
+        fail $name
+        verbose "Missing: $expected" 1
+    }
+}
+
+foreach name {ubuntu windows} {
+    set source [get_file [file join $root examples $name.m4]]
+    if {[catch {generate $source} message]} {
+        fail "$name generation"
+        verbose $message 1
+        continue
+    }
+    pass "$name generation"
+    set text [get_file $output]
+    # Syntax alone does not detect m4 stripping Bash array brackets.
+    foreach literal {{${BASH_SOURCE[0]}} {${pids[@]}} {${args[@]}} {${pids[-1]}}} {
+        check_contains $text $literal "$name preserves $literal"
+    }
+    if {![regexp {(?m)^dnl(?: |$)} $text]} {
+        pass "$name library comments do not leak"
+    } else { fail "$name library comments do not leak" }
+    if {[string first {#!/usr/bin/env bash} $text] == 0 && ![regexp {m4_[a-z]+\(} $text]} {
+        pass "$name complete template expansion"
+    } else { fail "$name complete template expansion" }
+    if {[catch {exec bash -n $output} message]} {
+        fail "$name bash syntax"
+    } else { pass "$name bash syntax" }
+    if {[file executable $output]} { pass "$name executable" } else { fail "$name executable" }
+    check_contains $text "vm_name='$name'" "$name VM_INIT"
+    check_contains $text {cpu_topology='4,sockets=1,cores=4,threads=1'} "$name CPU topology"
+    check_contains $text {file=$(vm_path 'my_vars.fd')} "$name relative firmware path"
+    check_contains $text {format=qcow2} "$name disk format"
+    if {$name eq "windows"} {
+        check_contains $text {tpm_dir=$(vm_path 'tpm')} "Windows TPM"
+        check_contains $text {vhost-user-fs-pci,chardev=charfs,tag=virtiofs} "Windows VirtIOFS"
+        check_contains $text {org.qemu.guest_agent.0} "Windows guest agent"
+        check_contains $text {index=1} "Windows second CDROM"
+        check_contains $text {tcp:127.0.0.1:2224-:22} "Windows forwarded port"
+    }
+    generate $source
+    if {[get_file $output] eq $text} { pass "$name reproducible output" } else { fail "$name reproducible output" }
+}
+
+# Each invalid input must fail without replacing the previous output.
+set cases {
+    {{VM_MEMORY([1024])
+VM_OUTPUT} {call VM_INIT first}}
+    {{VM_INIT([test])} {missing VM_OUTPUT}}
+    {{VM_INIT([test])
+VM_INIT([other])
+VM_OUTPUT} {duplicate VM_INIT}}
+    {{VM_INIT([test])
+VM_MEMORY([0])
+VM_OUTPUT} {positive integer}}
+    {{VM_INIT([test])
+VM_CPU([1], [4])
+VM_OUTPUT} {expected 3 arguments}}
+    {{VM_INIT([test])
+VM_DISK([a], [vmdk], [ahci])
+VM_OUTPUT} {disk format}}
+    {{VM_INIT([test])
+VM_DISK([a], [raw], [scsi])
+VM_OUTPUT} {disk bus}}
+    {{VM_INIT([test])
+VM_CDROM([])
+VM_OUTPUT} {empty value}}
+    {{VM_INIT([test])
+VM_CDROM([a'b])
+VM_OUTPUT} {single quotes}}
+    {{VM_INIT([test])
+VM_CDROM([a,b])
+VM_OUTPUT} {commas}}
+    {{VM_INIT([test])
+VM_CDROM([a
+b])
+VM_OUTPUT} {newlines}}
+    {{VM_INIT([test])
+VM_NETWORK_USER([65536], [22])
+VM_OUTPUT} {port exceeds}}
+    {{VM_INIT([test])
+VM_SHARE([/tmp], [bad tag])
+VM_OUTPUT} {invalid share tag}}
+    {{VM_INIT([test])
+VM_ARCH([X86 64])
+VM_OUTPUT} {invalid value}}
+    {{VM_INIT([test])
+VM_ARCH([AARCH64])
+VM_OUTPUT} {invalid value}}
+    {{VM_INIT([test])
+VM_QEMU([qemu-system-x86_64 -enable-kvm])
+VM_OUTPUT} {invalid value}}
+    {{VM_INIT([test])
+VM_ARCH([aarch64])
+VM_MACHINE([pc])
+VM_OUTPUT} {x86-only}}
+    {{VM_INIT([test])
+VM_UNKNOWN([x])
+VM_OUTPUT} {unknown macro}}
+    {{VM_INIT([test])
+VM_OUTPUT
+VM_MEMORY([1024])} {must be last}}
+    {{VM_INIT([test])
+VM_DISPLAY([sdl], [VGA])
+VM_OUTPUT} {display must}}
+    {{VM_INIT([test])
+VM_DISPLAY([gtk], [invalid])
+VM_OUTPUT} {unsupported graphics}}
+    {{VM_INIT([test])
+VM_AUDIO([invalid])
+VM_OUTPUT} {audio must}}
+    {{VM_INIT([test])
+VM_DISK([a], [raw], [virtio])
+VM_DISK([b], [raw], [virtio], [ro])
+VM_DISK([c], [raw], [ahci], [ro])
+VM_OUTPUT} {read-only disks require virtio}}
+    {{VM_INIT([test])
+VM_NETWORK_USER([22], [22])
+VM_NETWORK_USER([23], [23])
+VM_OUTPUT} {only one user network}}
+    {{VM_INIT([test])
+VM_TPM([a])
+VM_TPM([b])
+VM_OUTPUT} {duplicate VM_TPM}}
+    {{VM_INIT([test])
+VM_SHARE([a], [x])
+VM_SHARE([b], [y])
+VM_OUTPUT} {duplicate VM_SHARE}}
+}
+foreach pair $cases {
+    lassign $pair source expected
+    put_file $output "preserve me\n"
+    set status [catch {generate $source} message]
+    if {$status && [string first $expected $message] >= 0} {
+        pass "reject $expected"
+    } else {
+        fail "reject $expected"
+        verbose $message 1
+    }
+    if {[get_file $output] eq "preserve me\n" && [llength [glob -nocomplain $output.tmp.*]] == 0} {
+        pass "atomic output on $expected"
+    } else { fail "atomic output on $expected" }
+}
+
+# Record real shell argv, including paths with spaces and metacharacters.
+set source {VM_INIT([literal])
+VM_MEMORY([2048])
+VM_CPU([2], [3], [2])
+VM_DISK([disk $(not-executed).img], [raw], [virtio])
+VM_CDROM([install media.iso])
+VM_NETWORK_USER([2223], [22])
+VM_DISPLAY([none], [VGA])
+VM_AUDIO([pipewire])
+VM_OUTPUT
+}
+if {[catch {generate $source} message]} {
+    fail "literal paths generation"
+    verbose $message 1
+} else {
+    pass "literal paths generation"
+    set bin [file join $work bin]
+    file mkdir $bin
+    set capture [file join $work args.txt]
+    put_file [file join $bin qemu-system-x86_64] {#!/usr/bin/env bash
+printf '%s\n' "$@" > "$CAPTURE"
+}
+    file attributes [file join $bin qemu-system-x86_64] -permissions 0755
+    set old_path $env(PATH)
+    set env(PATH) "$bin:$old_path"
+    set env(CAPTURE) $capture
+    set status [catch {exec bash $output 2>@1} message]
+    set env(PATH) $old_path
+    unset env(CAPTURE)
+    if {$status} {
+        fail "generated script with QEMU argument recorder"
+        verbose $message 1
+    } else {
+        pass "generated script with QEMU argument recorder"
+        set arguments [split [string trimright [get_file $capture] "\n"] "\n"]
+        foreach {flag value} {-m 2048 -smp 12,sockets=2,cores=3,threads=2 -display none -audiodev pipewire,id=audio0} {
+            set index [lsearch -exact $arguments $flag]
+            if {$index >= 0 && [lindex $arguments [expr {$index + 1}]] eq $value} {
+                pass "recorded $flag"
+            } else { fail "recorded $flag" }
+        }
+        set expected "id=vmcreate_disk0,if=virtio,file=[file dirname $output]/disk \$(not-executed).img,format=raw"
+        if {[lsearch -exact $arguments $expected] >= 0} {
+            pass "literal shell metacharacters and spaces"
+        } else { fail "literal shell metacharacters and spaces" }
+    }
+}
+
+if {[catch {generate {VM_INIT([dnl VM_OUTPUT])
+VM_DISK([dnl VM_INIT.img], [raw], [virtio])
+VM_OUTPUT
+}} message]} {
+    fail "m4 macro names preserved as literal data"
+    verbose $message 1
+} else {
+    set text [get_file $output]
+    check_contains $text {vm_name='dnl VM_OUTPUT'} "m4 names in VM name"
+    check_contains $text {vm_path 'dnl VM_INIT.img'} "m4 names in disk path"
+}
+
+# VM_ARCH selects qemu-system-<arch>; VM_QEMU overrides the binary path.
+if {[catch {generate {VM_INIT([arch-test])
+VM_ARCH([aarch64])
+VM_ACCEL([tcg])
+VM_CPU_MODEL([cortex-a72])
+VM_OUTPUT
+}} message]} {
+    fail "VM_ARCH generation"
+    verbose $message 1
+} else {
+    pass "VM_ARCH generation"
+    set text [get_file $output]
+    check_contains $text {qemu_bin='qemu-system-aarch64'} "VM_ARCH selects the QEMU binary"
+    check_contains $text {machine_spec=''} "VM_ARCH omits the x86 machine"
+}
+
+if {[catch {generate {VM_INIT([qemu-test])
+VM_QEMU([/opt/qemu/bin/custom-qemu])
+VM_OUTPUT
+}} message]} {
+    fail "VM_QEMU generation"
+    verbose $message 1
+} else {
+    pass "VM_QEMU generation"
+    check_contains [get_file $output] {qemu_bin='/opt/qemu/bin/custom-qemu'} "VM_QEMU overrides the binary"
+}
+
+if {[catch {generate {VM_INIT([x86-test])
+VM_ARCH([x86_64])
+VM_OUTPUT
+}} message]} {
+    fail "x86_64 keeps the q35 default"
+    verbose $message 1
+} else {
+    pass "x86_64 keeps the q35 default"
+    check_contains [get_file $output] {machine_spec='q35,smm=on'} "x86_64 machine default"
+}
+
+foreach {arguments expected} [list {} {Usage:} [list missing.m4 $output] {configuration not found} [list $config $work] {not a directory}] {
+    set status [catch {exec bash [file join $root generate-boot.sh] {*}$arguments 2>@1} message]
+    if {$status && [string first $expected $message] >= 0} {
+        pass "CLI rejects $expected"
+    } else { fail "CLI rejects $expected" }
+}
+
+set before [get_file $config]
+set status [catch {exec bash [file join $root generate-boot.sh] $config $config 2>@1} message]
+if {$status && [get_file $config] eq $before && [string first {must not replace} $message] >= 0} {
+    pass "do not overwrite configuration"
+} else { fail "do not overwrite configuration" }
+file delete -force $work
