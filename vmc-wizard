@@ -223,6 +223,19 @@ storage_menu() {
     fi
 }
 
+network_model() {
+    local model
+    model=$(choose 'NIC model' 'virtio-net-pci' 'e1000' 'rtl8139' 'Custom')
+    if [[ "$model" == Custom ]]; then
+        model=$(ask_macro 'QEMU NIC device model (qemu-system-x86_64 -device help)' 'e1000e' 'e1000e')
+    fi
+    if [[ ! "$model" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.+-]*$ ]]; then
+        printf 'Invalid network model: expected a QEMU device name.\n' >&2
+        return 1
+    fi
+    printf '%s' "$model"
+}
+
 network_menu() {
     if [[ $(gum choose --header 'Advanced configuration (Network): skip to return' 'Skip' 'Continue') == Skip ]]; then
         return
@@ -230,7 +243,7 @@ network_menu() {
     local model mac protocol host_port guest_port address nic bridge ifname
     if [[ -z "$advanced_network" ]] && yes 'Attach a user-mode NIC?'; then
         advanced_network=$(ask 'NIC identifier' 'mgmt' 'mgmt')
-        model=$(choose 'NIC model' 'virtio-net-pci' 'e1000' 'rtl8139')
+        model=$(network_model)
         mac=$(ask 'MAC address (empty for QEMU default)' '' '52:54:00:12:34:56')
         if [[ -n "$mac" ]]; then
             advanced_lines+=("VM_NET_USER([$advanced_network], [$model], [$mac])")
@@ -250,14 +263,14 @@ network_menu() {
         refuse_inline || continue
         nic=$(ask 'NIC identifier' 'lan' 'lan')
         ifname=$(ask 'TAP interface' 'tap0' 'tap0')
-        model=$(choose 'NIC model' 'virtio-net-pci' 'e1000' 'rtl8139')
+        model=$(network_model)
         advanced_lines+=("VM_NET_TAP([$nic], [$ifname], [$model])")
     fi
     if yes 'Attach a bridge?'; then
         refuse_inline || continue
         nic=$(ask 'NIC identifier' 'bridge' 'bridge')
         bridge=$(ask 'Bridge name' 'br0' 'br0')
-        model=$(choose 'NIC model' 'virtio-net-pci' 'e1000' 'rtl8139')
+        model=$(network_model)
         advanced_lines+=("VM_NET_BRIDGE([$nic], [$bridge], [$model])")
     fi
 }
@@ -387,7 +400,18 @@ fi
 
 mkdir -p -- "$directory"
 printf '%s\n' "$config" > "$config_path"
-if ! bash "$generator" "$config_path" "$boot_path"; then
+# Pass the template location through, so an installed wizard with a custom
+# vmcreatedir (or a VMCREATE_SHARE override) regenerates with the same tree.
+share_args=()
+if [[ -n "${VM_SHARE_DIR:-}" ]]; then
+    share_args=(--share "$VM_SHARE_DIR")
+elif [[ "$generator" != "$root/vmc-generate-boot" ]]; then
+    installed_share=$(sed -n 's/^    root=\${VMCREATE_SHARE:-\([^}]*\)}$/\1/p' "$generator" 2>/dev/null | head -1)
+    if [[ -n "$installed_share" && -d "$installed_share" ]]; then
+        share_args=(--share "$installed_share")
+    fi
+fi
+if ! bash "$generator" "${share_args[@]}" "$config_path" "$boot_path"; then
     rm -f -- "$config_path"
     printf 'Generation failed; configuration removed again.\n' >&2
     exit 1

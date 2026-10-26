@@ -81,7 +81,10 @@ if {[catch {cli_run --dry-run --disk d:broken} msg] && [string first {format mus
     verbose $msg 1
 }
 
+
+
 set saved_path $env(PATH)
+set real_qemu [auto_execok qemu-system-x86_64]
 set env(PATH) "[file join $work bin]:$saved_path"
 set env(CAPTURE) [file join $work argv]
 proc ext_case {name body expected} {
@@ -122,6 +125,50 @@ VM_NET_BRIDGE([bridge0], [br0], [virtio-net-pci])} {
 {e1000,netdev=mgmt,mac=52:54:00:11:22:33}
 {tap,id=lan,ifname=tap0,script=no,downscript=no}
 {bridge,id=bridge0,br=br0}}
+
+# Models are QEMU device names, not a project-owned whitelist. All backends
+# must preserve them, including non-PCI names used by other machine types.
+foreach model {e1000e igb vmxnet3 pcnet ne2k_pci virtio-net-pci-transitional virtio-net-pci-non-transitional virtio-net-device lan9118 sungem} {
+    ext_case "network model $model" "VM_NET_USER(\[u\], \[$model\])\nVM_NET_TAP(\[t\], \[tap0\], \[$model\])\nVM_NET_BRIDGE(\[b\], \[br0\], \[$model\], \[52:54:00:12:34:56\])" [list "$model,netdev=u" "$model,netdev=t" "$model,netdev=b,mac=52:54:00:12:34:56"]
+}
+
+# Capability queries exit without starting a VM. When installed, exercise every
+# model advertised by the real QEMU while running scripts only with the recorder.
+if {$real_qemu eq {}} {
+    unsupported {local QEMU advertised NIC models (QEMU not installed)}
+} elseif {[catch {exec {*}$real_qemu -nic model=help 2>@1} models]} {
+    fail {query local QEMU NIC models}
+    verbose $models 1
+} else {
+    set count 0
+    foreach line [split $models "\n"] {
+        if {[regexp {^([A-Za-z0-9_][A-Za-z0-9_.+-]*)( \(aka [^)]*\))?$} $line -> model]} {
+            incr count
+            ext_case "local QEMU model $model" "VM_NET_USER(\[nic\], \[$model\])" [list "$model,netdev=nic"]
+        }
+    }
+    if {$count > 0} { pass {local QEMU NIC list exercised} } else { fail {local QEMU NIC list exercised}; verbose $models 1 }
+}
+
+# Reject syntax that could add QEMU properties or break shell/m4 literals.
+foreach {model error} {{} {empty value} {e1000e,netdev=other} {invalid network model} {bad model} {invalid network model} {-e1000e} {invalid network model} {e1000e;id} {invalid network model} {e1000e'bad} {single quotes} {e1000e
+bad} {newlines}} {
+    foreach declaration [list "VM_NET_USER(\[u\], \[$model\])" "VM_NET_TAP(\[t\], \[tap0\], \[$model\])" "VM_NET_BRIDGE(\[b\], \[br0\], \[$model\])"] {
+        ext_write $output "preserve\n"
+        if {[catch {ext_generate $declaration} msg] && [string first $error $msg] >= 0} {
+            pass "reject network model $declaration"
+        } else { fail "reject network model $declaration"; verbose $msg 1 }
+        if {[ext_read $output] eq "preserve\n"} { pass {invalid network model preserves output} } else { fail {invalid network model preserves output} }
+    }
+}
+
+# discard=unmap is only advertised by virtio; IDE/AHCI must be rejected.
+ext_case discard {VM_DISK([sys.qcow2], [qcow2], [virtio], [rw-discard])} {
+    {id=vmcreate_disk0,if=virtio,file=@DIR@/sys.qcow2,format=qcow2,discard=unmap}
+}
+ext_case discard-snapshot {VM_DISK([sys.qcow2], [qcow2], [virtio], [snapshot-discard])} {
+    {id=vmcreate_disk0,if=virtio,file=@DIR@/sys.qcow2,format=qcow2,snapshot=on,discard=unmap}
+}
 ext_case control {VM_HEADLESS
 VM_QMP([control.sock])
 VM_LOG([debug.log], [guest_errors,unimp])

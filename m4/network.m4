@@ -10,7 +10,8 @@ m4_define([_VM_NET_ID], [
 ])
 
 m4_define([_VM_NET_MODEL], [
-    m4_ifelse([$1], [virtio-net-pci], [], [$1], [e1000], [], [$1], [rtl8139], [], [_VM_FAIL([unsupported network model: $1])])
+    _VM_VALUE([$1])
+    m4_ifelse(m4_regexp([$1], [^[a-zA-Z0-9_][a-zA-Z0-9_.+-]*$]), [0], [], [_VM_FAIL([invalid network model: $1; expected a QEMU device name])])
 ])
 
 m4_define([_VM_NET_MAC], [

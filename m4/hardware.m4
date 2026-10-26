@@ -121,12 +121,18 @@ m4_divert(-1)
 ])
 
 m4_dnl _VM_STORAGE_MODE(mode)
+m4_dnl Accepted modes; discard is a suffix so rw-discard combines both.
 m4_define([_VM_STORAGE_MODE], [
-    m4_ifelse([$1], [rw], [], [$1], [ro], [], [$1], [snapshot], [], [_VM_FAIL([storage mode must be rw, ro or snapshot])])
+    m4_ifelse([$1], [rw], [],
+        [$1], [ro], [],
+        [$1], [snapshot], [],
+        [$1], [rw-discard], [],
+        [$1], [snapshot-discard], [],
+        [_VM_FAIL([storage mode must be rw, ro, snapshot, rw-discard or snapshot-discard])])
 ])
 
 m4_dnl _VM_STORAGE_OPTIONS(mode): emit only validated QEMU option suffixes.
-m4_define([_VM_STORAGE_OPTIONS], [m4_ifelse([$1], [ro], [,readonly=on], [$1], [snapshot], [,snapshot=on], [])])
+m4_define([_VM_STORAGE_OPTIONS], [m4_ifelse([$1], [ro], [,readonly=on], [$1], [snapshot], [,snapshot=on], [$1], [rw-discard], [,discard=unmap], [$1], [snapshot-discard], [,snapshot=on,discard=unmap], [])])
 
 m4_dnl _VM_IDE_ALLOC: reserve one shared IDE slot; family-specific check is final.
 m4_define([_VM_IDE_ALLOC], [
@@ -146,6 +152,8 @@ m4_define([VM_DISK], [
     m4_pushdef([_VM_MODE], m4_ifelse([$#], [3], [rw], [$4]))
     _VM_STORAGE_MODE(m4_defn([_VM_MODE]))
     m4_ifelse(_VM_MODE, [ro], [m4_ifelse([$3], [virtio], [], [_VM_FAIL([read-only disks require virtio; IDE/AHCI disks do not support ro])])])
+    m4_ifelse(_VM_MODE, [rw-discard], [m4_ifelse([$3], [virtio], [], [_VM_FAIL([discard requires virtio; IDE/AHCI do not advertise unmap])])])
+    m4_ifelse(_VM_MODE, [snapshot-discard], [m4_ifelse([$3], [virtio], [], [_VM_FAIL([discard requires virtio; IDE/AHCI do not advertise unmap])])])
     m4_ifelse([$3], [ide], [_VM_IDE_ALLOC])
     m4_pushdef([_VM_DISK_ID], [vmcreate_disk]_VM_DISK_COUNT)
     m4_divert(1)m4_dnl

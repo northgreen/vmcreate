@@ -61,24 +61,26 @@ VM_BOOT([cad], [a], [on])
 
 | 宏 | 说明 |
 |---|---|
-| `VM_DISK([文件], [raw或qcow2], [ide或ahci或virtio][,模式])` | 可重复；模式默认 `rw`，可选 `ro`、`snapshot`。只读系统盘先限 virtio，IDE/AHCI 的只读需求需用合适设备而非强行设置 |
+| `VM_DISK([文件], [raw或qcow2], [ide或ahci或virtio][,模式])` | 可重复；模式默认 `rw`，可选 `ro`、`snapshot`、`rw-discard`、`snapshot-discard`。`ro` 与 `*discard` 都要求 virtio：IDE/AHCI 不宣告 unmap，强行设置会被拒绝 |
 | `VM_CDROM([ISO])` | 可重复，raw 只读光盘；与 IDE 硬盘共享索引，避免冲突 |
 | `VM_FLOPPY([镜像][,单元[,模式]])` | raw 软盘，单元 0/1 不可重复；省略时为0；模式 rw/ro/snapshot |
 | `VM_SNAPSHOT` | QEMU 全局临时磁盘写入模式；退出丢弃临时层，不是保存/恢复快照的管理器 |
 
 AHCI 后端和控制器使用自动生成 ID，每控制器六个端口。传统 IDE 使用机器内置控制器，pc 最多四个槽，q35 最多六个；混合 CD 和 IDE 硬盘占用同一计数。
 
-**临时写入不等于隔离环境：**不保证 VARS、TPM 状态、VirtIOFS 共享、日志和外设不发生持久修改。`ro` 与 `snapshot` 语义不同：前者拒绝写入，后者允许向临时层写入。
+**临时写入不等于隔离环境：**不保证 VARS、TPM 状态、VirtIOFS 共享、日志和外设不发生持久修改。`ro` 与 `snapshot` 语义不同：前者拒绝写入，后者允许向临时层写入。`rw-discard` 让客机删除的簇回传给 qcow2（`discard=unmap`），宿主才会真正释放空间；`snapshot-discard` 是临时写入加丢弃回传，适合测试但退出即丢弃。
 
 ## 网络
 
 | 宏 | 说明 |
 |---|---|
 | `VM_NETWORK_USER([宿主端口], [客户机端口])` | 旧接口：net0、VirtIO 网卡、回环 TCP 转发；最多一次 |
-| `VM_NET_USER([ID], [型号][,MAC])` | 新建 user 网络，可重复；型号 virtio-net-pci/e1000/rtl8139 |
+| `VM_NET_USER([ID], [型号][,MAC])` | 新建 user 网络，可重复；接受任意 QEMU 网卡设备型号名 |
 | `VM_NET_FORWARD([ID], [tcp或udp], [宿主端口], [客户机端口][,宿主IPv4])` | 添加到已声明的 user 网络；默认127.0.0.1；端口1–65535；拒绝重复占用 |
 | `VM_NET_TAP([ID], [接口], [型号][,MAC])` | 使用已有 TAP，`script=no,downscript=no`；不创建接口、不提权 |
 | `VM_NET_BRIDGE([ID], [桥], [型号][,MAC])` | 由 QEMU bridge helper 接入已有桥；权限和 allowlist 由宿主管理 |
+
+三种后端的型号参数均直接传给 QEMU `-device`，不维护型号白名单，例如 `e1000e`、`igb`、`vmxnet3`、`pcnet`、`virtio-net-pci-transitional`。型号名只允许字母、数字、下划线、点、加号、连字符，且不能以点、加号或连字符开头；不能混入逗号或设备属性。用目标 QEMU 的 `-device help` 查看设备名，或用 `-nic model=help` 查看当前配置的网卡列表（不要使用仅限 `-nic` 的别名，如 `virtio`）。生成器不要求安装 QEMU；型号是否存在、是否为网卡，以及总线和机器是否兼容，由实际运行的 QEMU 检查。向导的 `NIC model → Custom` 可输入这些设备名。
 
 ID 唯一，`vmcreate_` 前缀保留给内部设备。转发必须在对应 user 网络声明之后；不能给 TAP/bridge 添加 user 转发。多网卡的路由由客户机设置。
 

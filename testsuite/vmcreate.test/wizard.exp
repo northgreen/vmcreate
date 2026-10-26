@@ -115,6 +115,32 @@ if {[file readable [file join $storage_dir vm.m4]]} {
     check_contains [get_file [file join $storage_dir vm.m4]] {VM_DISK([data.img], [raw], [virtio], [snapshot])} "storage writes extra disk"
 }
 
+# Every network backend offers arbitrary QEMU device names via Custom.
+set network_dir [file join $work network]
+set status [run_case [concat $basic_prefix {Configure
+    {Network: user NIC, forwards, TAP, bridge} Continue
+    y mgmt Custom e1000e {} n
+    y lan tap0 Custom vmxnet3
+    y uplink br0 Custom virtio-net-pci-non-transitional Done}] $network_dir]
+if {$status} { fail "network custom models complete"; verbose $::last_message 1 } else { pass "network custom models complete" }
+if {[file readable [file join $network_dir vm.m4]]} {
+    set text [get_file [file join $network_dir vm.m4]]
+    foreach line {{VM_NET_USER([mgmt], [e1000e])} {VM_NET_TAP([lan], [tap0], [vmxnet3])} {VM_NET_BRIDGE([uplink], [br0], [virtio-net-pci-non-transitional])}} {
+        check_contains $text $line "network writes $line"
+    }
+    set command [string map [list {\,} ,] [exec bash [file join $network_dir boot.sh] --dry-run 2>@1]]
+    foreach device {e1000e,netdev=mgmt vmxnet3,netdev=lan virtio-net-pci-non-transitional,netdev=uplink} {
+        check_contains $command $device "network dry-run preserves $device"
+    }
+}
+set invalid_network_dir [file join $work invalid-network]
+set status [run_case [concat $basic_prefix {Configure
+    {Network: user NIC, forwards, TAP, bridge} Continue
+    y mgmt Custom {bad model}}] $invalid_network_dir]
+if {$status && [string first {Invalid network model} $::last_message] >= 0 && ![file exists [file join $invalid_network_dir vm.m4]]} {
+    pass "wizard rejects malformed custom NIC before writing"
+} else { fail "wizard rejects malformed custom NIC before writing"; verbose $::last_message 1 }
+
 # Invalid VM names are re-asked before the rest of the flow continues.
 set invalid_dir [file join $work invalid]
 set status [run_case [concat {bad name! name-vm} [lrange $basic_prefix 1 end] {Skip}] $invalid_dir]

@@ -12,3 +12,5 @@
 - README 面向用户记录用法和边界。新增宏同时维护生成器的已知宏检查、README 和 DejaGnu 用例。
 - m4 排版约束：第一行安装方括号引用，库内注释使用 `m4_dnl`；在包含 Bash 模板期间临时切换到 `<<< >>>`，之后恢复方括号供 EOF 校验使用。禁止把未定义的 `dnl` 放到初始化之前；模板数组引用和首行 shebang 由 DejaGnu 回归测试保护。
 - 高级宏按职责分为 `m4/hardware.m4`、`network.m4`、`control.m4`，由 `vm.m4` 在配置之前加载；扩展测试位于 `extensions.exp`，实际argv使用QEMU替身，VirtIOFS替身用Python Unix socket检查就绪、只读和清理。独立接口事实文档为 `MACROS.md`，TUI保持基础项。
+
+- 网络型号不维护固定白名单：`VM_NET_USER/TAP/BRIDGE` 接受安全的 QEMU `-device` 型号名，设备存在性和机器/总线兼容性交给运行时 QEMU；向导保留常用项并提供 `Custom` 输入。测试应覆盖三种后端和非法型号属性注入；可用时查询本机 QEMU 网卡列表，禁止启动真实虚拟机。
