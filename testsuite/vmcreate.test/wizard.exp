@@ -67,7 +67,7 @@ proc run_case {answers directory} {
     file mkdir $directory
     write_answers $payload [concat $answers [list $directory]]
     set ::last_message {}
-    return [catch {exec bash [file join $root wizard.sh] < $payload 2>@1} ::last_message]
+    return [catch {exec bash [file join $root vmc-wizard] < $payload 2>@1} ::last_message]
 }
 
 # Basic flow keeps steps 1-10, then the output directory; advanced is skipped.

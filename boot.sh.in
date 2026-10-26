@@ -3,6 +3,61 @@ set -euo pipefail
 
 # Resolve resources against this script, independent of the caller directory.
 vm_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+
+# Command-line overrides.  They apply to this launch only and never rewrite the
+# configuration; --help lists them, `--` passes the rest to QEMU verbatim.
+dry_run=0
+cli_boot=
+cli_qemu=
+cli_snapshot=0
+keep_runtime=0
+print_runtime=0
+extra_args=()
+media_args=()
+help_text() {
+    cat <<HELP
+Usage: boot.sh [options] [-- QEMU args...]
+
+  --dry-run              print the final QEMU command and exit
+  --qemu PATH            use another QEMU binary for this launch
+  --snapshot             discard disk writes for this launch
+  --boot ORDER           boot order such as cad, cd or d
+  --cdrom FILE           replace all configured CD-ROMs (repeatable, max 4)
+  --floppy FILE          replace all configured floppies (repeatable, max 2)
+  --disk FILE[:FORMAT[:BUS[:MODE]]]
+                         add a disk; format raw|qcow2, bus ide|ahci|virtio,
+                         mode rw|ro|snapshot (defaults raw:virtio:rw)
+  --keep-runtime         keep the socket/TMPDIR directory after exit
+  --print-runtime        print that directory and keep it
+  -h, --help             show this help and exit
+  --                     forward every remaining argument to QEMU unchanged
+
+Overrides replace, never duplicate, the configured values.
+HELP
+}
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --dry-run) dry_run=1 ;;
+        --snapshot) cli_snapshot=1 ;;
+        --keep-runtime) keep_runtime=1 ;;
+        --print-runtime) keep_runtime=1 print_runtime=1 ;;
+        -h | --help) help_text; exit 0 ;;
+        --qemu | --boot | --cdrom | --floppy | --disk)
+            [[ $# -ge 2 ]] || { printf 'vmcreate: %s needs a value\n' "$1" >&2; exit 2; }
+            case "$1" in
+                --qemu) cli_qemu=$2 ;;
+                --boot) cli_boot=$2 ;;
+                --cdrom) media_args+=("cdrom:$2") ;;
+                --floppy) media_args+=("floppy:$2") ;;
+                --disk) media_args+=("disk:$2") ;;
+            esac
+            shift
+            ;;
+        --) shift; extra_args=("$@"); break ;;
+        *) printf 'vmcreate: unknown option %s (try --help)\n' "$1" >&2; exit 2 ;;
+    esac
+    shift
+done
 # Each launch owns its sockets; persistent disks and TPM state stay outside.
 # QEMU treats commas in a resolved directory as option separators, so stop early.
 for root_path in "$vm_dir" "${TMPDIR:-/tmp}"; do
@@ -25,7 +80,11 @@ cleanup() {
     for pid in "${pids[@]}"; do
         wait "$pid" 2>/dev/null || :
     done
-    rm -rf -- "$runtime_dir"
+    if ((keep_runtime)); then
+        printf 'vmcreate: kept runtime directory %s\n' "$runtime_dir" >&2
+    else
+        rm -rf -- "$runtime_dir"
+    fi
 }
 trap cleanup EXIT
 trap 'exit 130' INT
@@ -55,12 +114,119 @@ wait_socket() {
 
 # Insert validated device settings before resolving final memory/CPU values.
 m4_undivert(1)
+
+# Command-line media replaces the configured list wholesale.  Indexes are
+# reassigned here because capacity depends on the machine chosen above.
+ide_count=0
+cdrom_count=0
+floppy_count=0
+cli_ahci=0
+cli_ide=0
+virtio_count=0
+ide_used=$(printf '%s\n' "${args[@]}" | grep -c 'if=ide,index=' || true)
+# Media options are stored as one "--drive <value>" pair; drop both halves.
+if ((${#media_args[@]})); then
+    base_args=()
+    skip=0
+    for arg in "${args[@]}"; do
+        if ((skip)); then
+            skip=0
+            continue
+        fi
+        case "$arg" in
+            *media=cdrom,readonly=on,if=ide,index=* | *if=ide,index=*id=vmcreate_disk* | *if=floppy,index=*)
+                if ((${#base_args[@]})) && [[ ${base_args[-1]} == -drive ]]; then
+                    unset 'base_args[-1]'
+                else
+                    skip=1
+                fi
+                ;;
+            *) base_args+=("$arg") ;;
+        esac
+    done
+    args=("${base_args[@]+"${base_args[@]}"}")
+fi
+for spec in "${media_args[@]}"; do
+    kind=${spec%%:*}
+    value=${spec#*:}
+    case "$kind" in
+        cdrom)
+            ((cdrom_count < 4)) || { printf 'vmcreate: at most 4 --cdrom entries\n' >&2; exit 2; }
+            args+=(-drive "file=$(vm_path "$value"),format=raw,media=cdrom,readonly=on,if=ide,index=$((ide_count + cdrom_count))")
+            cdrom_count=$((cdrom_count + 1))
+            ;;
+        floppy)
+            ((floppy_count < 2)) || { printf 'vmcreate: at most 2 --floppy entries\n' >&2; exit 2; }
+            args+=(-drive "file=$(vm_path "$value"),format=raw,if=floppy,index=$floppy_count")
+            floppy_count=$((floppy_count + 1))
+            ;;
+        disk)
+            IFS=: read -r file format bus mode < <(printf '%s\n' "$value")
+            [[ -n "$format" ]] || format=raw
+            [[ -n "$bus" ]] || bus=virtio
+            [[ -n "$mode" ]] || mode=rw
+            [[ "$format" == raw || "$format" == qcow2 ]] || {
+                printf 'vmcreate: --disk format must be raw or qcow2\n' >&2
+                exit 2
+            }
+            [[ "$bus" == ide || "$bus" == ahci || "$bus" == virtio ]] || {
+                printf 'vmcreate: --disk bus must be ide, ahci or virtio\n' >&2
+                exit 2
+            }
+            [[ -n "$file" ]] || {
+                printf 'vmcreate: --disk needs FILE[:FORMAT[:BUS[:MODE]]]\n' >&2
+                exit 2
+            }
+            case "$mode" in
+                rw) option= ;;
+                ro) option=,readonly=on ;;
+                snapshot) option=,snapshot=on ;;
+                *) printf 'vmcreate: --disk mode must be rw, ro or snapshot\n' >&2; exit 2 ;;
+            esac
+            disk_id="vmcreate_cli_disk$((cli_ide + cli_ahci + virtio_count))"
+            if [[ "$bus" == ide ]]; then
+                ((ide_used + cli_ide < ide_capacity)) || {
+                    printf 'vmcreate: --disk exceeds the %s IDE slots\n' "$ide_capacity" >&2
+                    exit 2
+                }
+                args+=(-drive "id=$disk_id,if=ide,file=$(vm_path "$file"),format=$format,index=$((ide_used + cli_ide))$option")
+                cli_ide=$((cli_ide + 1))
+            elif [[ "$bus" == ahci ]]; then
+                slot=$((ide_count + cli_ahci))
+                cli_ahci=$((cli_ahci + 1))
+                args+=(-device "ahci,id=vmcreate_cli_ahci$((slot / 6))")
+                args+=(-drive "id=$disk_id,if=none,file=$(vm_path "$file"),format=$format$option"
+                    -device "ide-hd,drive=$disk_id,bus=vmcreate_cli_ahci$((slot / 6)).$((slot % 6))")
+            else
+                args+=(-drive "id=$disk_id,if=virtio,file=$(vm_path "$file"),format=$format$option")
+                virtio_count=$((virtio_count + 1))
+            fi
+            ;;
+    esac
+done
+cli_ahci=0
 # Finalize singleton settings once; declarations can appear in any order.
 args+=(-m "$memory_mib" -smp "$cpu_topology"
        -accel "$accel" -cpu "${cpu_model}${cpu_flags:+,$cpu_flags}" -monitor "$monitor_mode")
 # Non-x86 architectures keep QEMU's built-in default machine.
 if [[ -n "$machine_spec" ]]; then
     args+=(-machine "$machine_spec")
+fi
+
+# --snapshot applies QEMU's temporary-write mode for this launch.
+if ((cli_snapshot)); then
+    args+=(-snapshot)
+fi
+# --qemu overrides the binary resolved by VM_ARCH / VM_QEMU.
+if [[ -n "$cli_qemu" ]]; then
+    qemu_bin=$cli_qemu
+fi
+# --boot overrides VM_BOOT for this launch.
+if [[ -n "$cli_boot" ]]; then
+    boot_opt=order=$cli_boot
+fi
+if [[ -n "$boot_opt" ]]; then
+    args+=(-boot "$boot_opt")
 fi
 for backend in "${net_backends[@]}"; do
     args+=(-netdev "$backend")
@@ -85,6 +251,20 @@ if [[ -n "$share_dir" ]]; then
         --shared-dir="$share_dir" "${virtiofs_args[@]}" &
     pids+=("$!")
     wait_socket "$runtime_dir/virtiofs.sock" "${pids[-1]}"
+fi
+
+# Forwarded arguments come last so they can override earlier single-valued ones.
+for forwarded in "${extra_args[@]+"${extra_args[@]}"}"; do
+    args+=("$forwarded")
+done
+
+if ((dry_run)); then
+    printf '%q ' "$qemu_bin" "${args[@]}"
+    printf '\n'
+    exit 0
+fi
+if ((print_runtime)); then
+    printf 'vmcreate: runtime directory %s\n' "$runtime_dir"
 fi
 
 # Preserve monitor stdin while retaining a PID for signal cleanup.

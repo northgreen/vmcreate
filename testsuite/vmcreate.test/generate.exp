@@ -19,7 +19,7 @@ proc get_file {path} {
 proc generate {source} {
     global config output root
     put_file $config $source
-    return [exec bash [file join $root generate-boot.sh] $config $output 2>@1]
+    return [exec bash [file join $root vmc-generate-boot] $config $output 2>@1]
 }
 proc check_contains {text expected name} {
     if {[string first $expected $text] >= 0} { pass $name } else {
@@ -265,14 +265,14 @@ VM_OUTPUT
 }
 
 foreach {arguments expected} [list {} {Usage:} [list missing.m4 $output] {configuration not found} [list $config $work] {not a directory}] {
-    set status [catch {exec bash [file join $root generate-boot.sh] {*}$arguments 2>@1} message]
+    set status [catch {exec bash [file join $root vmc-generate-boot] {*}$arguments 2>@1} message]
     if {$status && [string first $expected $message] >= 0} {
         pass "CLI rejects $expected"
     } else { fail "CLI rejects $expected" }
 }
 
 set before [get_file $config]
-set status [catch {exec bash [file join $root generate-boot.sh] $config $config 2>@1} message]
+set status [catch {exec bash [file join $root vmc-generate-boot] $config $config 2>@1} message]
 if {$status && [get_file $config] eq $before && [string first {must not replace} $message] >= 0} {
     pass "do not overwrite configuration"
 } else { fail "do not overwrite configuration" }

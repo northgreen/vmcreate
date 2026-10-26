@@ -13,6 +13,23 @@ m4_undivert(1)
 
 diversion 1 按声明顺序累积：`VM_INIT` 的变量块在最前，其后是各设备宏的片段；`_VM_HARDWARE_CHECK` 在 `VM_OUTPUT` 时最后追加解析结果。所以模板中这段之后的代码，看到的一定是最终值。
 
+## 命令行覆盖
+
+模板在 `vm_dir` 解析之后、临时目录创建之前解析参数，覆盖值只在本次启动生效：
+
+| 选项 | 效果 |
+|---|---|
+| `--dry-run` | 打印 `qemu_bin` 与全部参数后退出，不创建临时目录、不启动服务 |
+| `--qemu PATH` | 覆盖 `VM_ARCH` / `VM_QEMU` 解析出的 `qemu_bin` |
+| `--snapshot` | 追加 `-snapshot` |
+| `--boot ORDER` | 覆盖 `VM_BOOT` 的 `order=` |
+| `--cdrom FILE` / `--floppy FILE` | 丢弃配置里的同类设备，按新顺序重排索引 |
+| `--disk SPEC` | 追加一块盘，`FILE[:FORMAT[:BUS[:MODE]]]` |
+| `--keep-runtime` / `--print-runtime` | `cleanup` 保留临时目录并打印路径 |
+| `--` | 其余参数追加到 `args` 末尾 |
+
+配置派生的参数在 `m4_undivert(1)` 之后才存在，所以 `--qemu`、`--boot`、`--snapshot` 都先记录在 `cli_*` 变量里，等汇总阶段再应用；否则会被后续赋值覆盖。介质类选项在汇总前把配置里的 `-drive` 成对剔除，再按 `index=` 重新编号。
+
 ## 运行时变量
 
 `VM_INIT` 建立，后续宏覆盖；模板只读取，不重新赋值。

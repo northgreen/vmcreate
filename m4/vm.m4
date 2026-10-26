@@ -87,6 +87,7 @@ cpu_flags=
 monitor_mode=stdio
 serial_mode=none
 serial_path=
+boot_opt=
 net_backends=()
 virtiofs_args=()
 args=(

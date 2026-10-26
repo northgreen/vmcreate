@@ -1,6 +1,6 @@
 # VM 宏参考（2026）
 
-配置是受信任的 GNU m4 程序，不是安全沙箱。运行 `bash generate-boot.sh machine.m4 output/boot.sh` 生成独立 Bash 脚本；不会创建磁盘、下载镜像、绑定驱动或启动客户机。
+配置是受信任的 GNU m4 程序，不是安全沙箱。运行 `bash vmc-generate-boot machine.m4 output/boot.sh` 生成独立 Bash 脚本；不会创建磁盘、下载镜像、绑定驱动或启动客户机。
 
 ## 语法和路径
 

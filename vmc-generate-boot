@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+    cat >&2 <<EOF
+Usage: $0 [--share DIR] CONFIG.m4 OUTPUT/boot.sh
+
+  --share DIR   look for m4/ and boot.sh.in in DIR instead of this script's
+                directory (installed trees use /usr/share/vmcreate).
+
+  VMCREATE_SHARE overrides the same location when the option is absent;
+  relative paths are resolved against the current directory.  Missing
+  templates fall back to the directory holding this script.
+EOF
+}
+
+root=
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --share)
+            [[ $# -ge 2 ]] || { usage; exit 2; }
+            root=$2
+            shift 2
+            ;;
+        --share=*)
+            root=${1#--share=}
+            shift
+            ;;
+        -h | --help)
+            usage
+            exit 0
+            ;;
+        --)
+            shift
+            break
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+if [[ $# -ne 2 ]]; then
+    usage
+    exit 2
+fi
+
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+if [[ -z "$root" ]]; then
+    root=${VMCREATE_SHARE:-$script_dir}
+fi
+if [[ ! -f "$root/m4/vm.m4" || ! -f "$root/boot.sh.in" ]]; then
+    if [[ -f "$script_dir/m4/vm.m4" && -f "$script_dir/boot.sh.in" && "$root" != "$script_dir" ]]; then
+        printf 'vmcreate: no templates in %s; using %s\n' "$root" "$script_dir" >&2
+        root=$script_dir
+    else
+        printf 'vmcreate: missing templates in %s (need m4/vm.m4 and boot.sh.in)\n' "$root" >&2
+        exit 1
+    fi
+fi
+root=$(cd -- "$root" && pwd)
+# Absolutise both operands: m4 -I resolves relative include paths against the
+# current directory, so a relative input would be expanded against the wrong
+# tree once this script is run from elsewhere.
+input=$(realpath -- "$1")
+output=$(realpath --no-symlinks -- "$2" 2>/dev/null || realpath -- "$2" 2>/dev/null || printf '%s' "$2")
+case "$output" in
+    /*) ;;
+    *) output="$(pwd)/$output" ;;
+esac
+if [[ ! -f "$input" ]]; then
+    printf 'vmcreate: configuration not found: %s\n' "$1" >&2
+    exit 1
+fi
+if [[ -d "$output" ]]; then
+    printf 'vmcreate: output must be a file, not a directory\n' >&2
+    exit 1
+fi
+if [[ "$input" -ef "$output" ]]; then
+    printf 'vmcreate: output must not replace the configuration\n' >&2
+    exit 1
+fi
+# Reject misspelled public macros before discarded m4 text can hide them.
+while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" =~ ^[[:space:]]*(VM_[A-Z_]+) ]]; then
+        case "${BASH_REMATCH[1]}" in
+            VM_MACHINE|VM_ARCH|VM_QEMU|VM_ACCEL|VM_CPU_MODEL|VM_CPU_FLAGS|VM_BOOT|VM_FLOPPY|VM_SNAPSHOT|VM_KERNEL|VM_NET_USER|VM_NET_FORWARD|VM_NET_TAP|VM_NET_BRIDGE|VM_MONITOR|VM_SERIAL|VM_HEADLESS|VM_VNC|VM_SPICE|VM_LOG|VM_QMP|VM_USB_HOST|VM_VFIO|VM_INIT|VM_MEMORY|VM_CPU|VM_UEFI|VM_DISK|VM_CDROM|VM_NETWORK_USER|VM_TPM|VM_SHARE|VM_DISPLAY|VM_AUDIO|VM_GUEST_AGENT|VM_OUTPUT) ;;
+            *) printf 'vmcreate: unknown macro: %s\n' "${BASH_REMATCH[1]}" >&2; exit 1 ;;
+        esac
+    fi
+done < "$input"
+command -v m4 >/dev/null || { printf 'vmcreate: GNU m4 is required\n' >&2; exit 1; }
+mkdir -p -- "$(dirname -- "$output")"
+# Stage beside the destination: failed expansion never replaces an existing script.
+temporary=$(mktemp "${output}.tmp.XXXXXXXX")
+trap 'rm -f -- "$temporary"' EXIT
+# Prefixed builtins avoid collisions with ordinary words in shell/config text.
+# m4 resolves included files against the first -I that contains them, and the
+# expression ${BASH_SOURCE[0]} below is also a path lookup, so run from --share
+# directory where boot.sh.in lives; otherwise a same-named file elsewhere wins.
+(
+    cd -- "$root"
+    exec m4 --fatal-warnings -P -I "$root/m4" -I "$root" -- "$root/m4/vm.m4" "$input"
+) > "$temporary"
+while IFS= read -r line; do
+    if [[ "$line" =~ ^[[:space:]]*VM_[A-Z_]+ ]]; then
+        printf 'vmcreate: unexpanded macro: %s\n' "$line" >&2
+        exit 1
+    fi
+done < "$temporary"
+# Publish only a syntactically valid script; same-directory rename is atomic.
+bash -n "$temporary"
+chmod +x "$temporary"
+mv -f -- "$temporary" "$output"
+printf 'Generated %s\n' "$output"

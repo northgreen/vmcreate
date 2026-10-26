@@ -2,6 +2,16 @@
 set -euo pipefail
 
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# Locate the generator the same way an installed copy would: next to this
+# script first, otherwise on PATH.
+if [[ -x "$root/vmc-generate-boot" ]]; then
+    generator=$root/vmc-generate-boot
+elif command -v vmc-generate-boot >/dev/null 2>&1; then
+    generator=$(command -v vmc-generate-boot)
+else
+    printf 'vmc-wizard: vmc-generate-boot not found next to this script or on PATH\n' >&2
+    exit 1
+fi
 if ! command -v gum >/dev/null; then
     printf 'vmcreate: wizard needs gum (https://github.com/charmbracelet/gum)\n' >&2
     exit 1
@@ -377,7 +387,7 @@ fi
 
 mkdir -p -- "$directory"
 printf '%s\n' "$config" > "$config_path"
-if ! bash "$root/generate-boot.sh" "$config_path" "$boot_path"; then
+if ! bash "$generator" "$config_path" "$boot_path"; then
     rm -f -- "$config_path"
     printf 'Generation failed; configuration removed again.\n' >&2
     exit 1

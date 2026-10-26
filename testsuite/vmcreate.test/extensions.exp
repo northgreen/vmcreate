@@ -11,13 +11,76 @@ proc ext_read {path} { set f [open $path r]; set s [read $f]; close $f; return $
 proc ext_generate {body} {
     global root config output
     ext_write $config "VM_INIT(\[test\])\n$body\nVM_OUTPUT\n"
-    exec bash [file join $root generate-boot.sh] $config $output 2>@1
+    exec bash [file join $root vmc-generate-boot] $config $output 2>@1
 }
 file mkdir [file join $work bin]
 ext_write [file join $work bin qemu-system-x86_64] {#!/usr/bin/env bash
 printf '%s\n' "$@" > "$CAPTURE"
 }
 file attributes [file join $work bin qemu-system-x86_64] -permissions 0755
+
+# Command-line overrides: --dry-run prints the command and never starts QEMU.
+set cli [file join $work cli]
+file mkdir $cli
+ext_write [file join $cli vm.m4] {VM_INIT([cli])
+VM_DISK([sys.img], [raw], [ide])
+VM_CDROM([orig.iso])
+VM_FLOPPY([orig.img], [0], [ro])
+VM_BOOT([c])
+VM_OUTPUT
+}
+exec bash [file join $root vmc-generate-boot] [file join $cli vm.m4] [file join $cli boot.sh] 2>@1
+proc cli_run {args} {
+    global cli
+    exec bash [file join $cli boot.sh] {*}$args 2>@1
+}
+proc cli_check {name actual pattern expect} {
+    if {[regexp -- $pattern $actual] == $expect} {
+        pass $name
+    } else {
+        fail $name
+        verbose $actual 1
+    }
+}
+set base [cli_run --dry-run]
+cli_check {cli default boot order} $base {-boot order=c} 1
+cli_check {cli default cdrom} $base {orig\.iso} 1
+set replaced [cli_run --dry-run --cdrom new.iso]
+cli_check {cli --cdrom replaces configured media} $replaced {new\.iso} 1
+cli_check {cli --cdrom drops the configured one} $replaced {orig\.iso} 0
+set flopped [cli_run --dry-run --floppy new.img]
+cli_check {cli --floppy replaces configured media} $flopped {new\.img} 1
+cli_check {cli --floppy drops the configured one} $flopped {orig\.img} 0
+set extra [cli_run --dry-run --disk data.qcow2:qcow2:virtio:ro]
+cli_check {cli --disk appends a disk} $extra {vmcreate_cli_disk0} 1
+cli_check {cli --disk honours the read-only mode} $extra {readonly=on} 1
+set ide2 [cli_run --dry-run --disk a:raw:ide]
+cli_check {cli --disk continues the IDE indexes} $ide2 {index=1} 1
+set boot [cli_run --dry-run --boot cad]
+cli_check {cli --boot replaces the boot order} $boot {-boot order=cad} 1
+cli_check {cli --boot does not keep the old order} $boot {-boot order=c\b} 0
+set snap [cli_run --dry-run --snapshot]
+cli_check {cli --snapshot adds the temporary-write flag} $snap {-snapshot} 1
+set qemu [cli_run --dry-run --qemu /opt/qemu/qemu-test]
+cli_check {cli --qemu replaces the binary} $qemu {^/opt/qemu/qemu-test } 1
+set passthrough [cli_run --dry-run -- -no-reboot -enable-fips]
+cli_check {cli -- forwards raw QEMU arguments} $passthrough {-no-reboot -enable-fips } 1
+set helper [cli_run --help]
+cli_check {cli --help documents --dry-run} $helper {--dry-run} 1
+cli_check {cli --help documents the forward separator} $helper {forward every remaining argument} 1
+if {[catch {cli_run --bogus} msg] && [string first {unknown option} $msg] >= 0} {
+    pass {cli rejects unknown options}
+} else {
+    fail {cli rejects unknown options}
+    verbose $msg 1
+}
+if {[catch {cli_run --dry-run --disk d:broken} msg] && [string first {format must be raw or qcow2} $msg] >= 0} {
+    pass {cli rejects malformed --disk}
+} else {
+    fail {cli rejects malformed --disk}
+    verbose $msg 1
+}
+
 set saved_path $env(PATH)
 set env(PATH) "[file join $work bin]:$saved_path"
 set env(CAPTURE) [file join $work argv]
