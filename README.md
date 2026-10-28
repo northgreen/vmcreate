@@ -1,6 +1,6 @@
 # vmcreate
 
-用一份可读的配置文件描述虚拟机，生成一个独立、可重复运行的 QEMU 启动脚本。
+用一份可读的配置文件描述虚拟机，生成一个独立、可重复运行的 QEMU 启动脚本，就像是autotools那样
 
 ```bash
 bash ./vmc-wizard
@@ -19,6 +19,10 @@ cd ~/vm/my-vm
 ## 快速开始
 
 需要一个可用的 QEMU，以及 Bash 和 GNU m4。
+
+对于一个现代的Linux操作系统往往只需要补全QEMU即可，其余的很可能已经在你的电脑上而你没有注意到
+
+此外对于交互向导还需要gum
 
 ```bash
 make install prefix=$HOME/.local    # 或者直接在本目录用
@@ -92,11 +96,7 @@ make check         # DejaGnu 测试：真实调用 m4，用参数记录器代替
 make examples
 ```
 
-测试不会启动虚拟机，只验证 m4 展开、错误配置被拒绝、输出原子替换、Bash 语法和最终传给 QEMU 的参数。运行脚本本身也需要 `swtpm`、`virtiofsd` 或图形后端时，由测试替身模拟。测试记录在 `build/test-results/`。
-
-向导测试用临时 `gum` 替身驱动，不需要真实终端。
-
 ## 许可证
 
-本项目以 GNU General Public License v3.0（GPLv3）发布，全文见 [LICENSE](LICENSE)。
+本项目以 GNU General Public License v3.0（GPLv3）发布
 

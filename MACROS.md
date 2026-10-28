@@ -1,6 +1,4 @@
-# VM 宏参考（2026）
-
-配置是受信任的 GNU m4 程序，不是安全沙箱。运行 `bash vmc-generate-boot machine.m4 output/boot.sh` 生成独立 Bash 脚本；不会创建磁盘、下载镜像、绑定驱动或启动客户机。
+# VM 宏参考
 
 ## 语法和路径
 
@@ -126,8 +124,3 @@ USB 总线/地址可能在重新插拔后变化；需自行配置访问权限。
 
 VirtIOFS 需要本机 virtiofsd（默认 `/usr/lib/virtiofsd`，环境变量 `VIRTIOFSD` 可覆盖）及客户机驱动。共享rw目录允许客户机修改宿主文件，优先共享专用目录或ro目录。
 
-## 验证边界
-
-示例：`examples/freedos.m4` 展示 PC/TCG/IDE/软盘，`examples/server.m4` 展示多盘、多转发、只读共享及内核直启。
-
-使用 DejaGnu `make check` 验证真实 m4 展开、错误拒绝、Shell 参数与服务替身；`make examples` 生成示例。验证不包含客户机开机、固件兼容性、真实网桥权限或VFIO设备访问。TUI保持基础创建流程，高级参数编辑 `.m4` 使用。
